@@ -44,7 +44,7 @@ class WorkspaceCreatorTool(BaseTool):
             
             # Create LLM instance for file generation
             llm = ChatGoogleGenerativeAI(
-                model="gemini-pro",
+                model="gemini-2.0-pro-exp-02-05",
                 google_api_key=GOOGLE_API_KEY,
                 convert_system_message_to_human=True,
                 temperature=0.1
@@ -137,7 +137,7 @@ class PaperValidatorTool(BaseTool):
             
             # Update timeout and add retry logic in PaperValidatorTool._run
             llm = ChatGoogleGenerativeAI(
-                model="gemini-pro",
+                model="gemini-2.0-pro-exp-02-05",
                 google_api_key=GOOGLE_API_KEY,
                 convert_system_message_to_human=True,
                 temperature=0.1,
@@ -261,7 +261,7 @@ Required JSON structure:
 def create_agent(name: str):
     # Create LLM model
     llm = ChatGoogleGenerativeAI(
-        model="gemini-pro",
+        model="gemini-2.0-pro-exp-02-05",
         google_api_key=GOOGLE_API_KEY,
         convert_system_message_to_human=True,
         temperature=0.1

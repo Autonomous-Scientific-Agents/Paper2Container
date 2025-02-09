@@ -224,16 +224,6 @@ Required JSON structure:
     async def _arun(self, query: str) -> str:
         raise NotImplementedError("Async version not implemented")
 
-class HelloTool(BaseTool):
-    name = "hello_tool"
-    description = "Returns a simple hello message"
-    
-    def _run(self, query: str) -> str:
-        return "Hello! I'm a response from a tool!"
-    
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("async version not implemented yet")
-
 def create_agent(name: str):
     # Create LLM model
     llm = ChatGoogleGenerativeAI(
@@ -301,27 +291,8 @@ def create_agent(name: str):
         Final Answer: [TOOL_RESPONSE]
         """
     else:
-        tools = [HelloTool()]
-        template = """You are an AI assistant. Use exactly one tool to respond to the user's request.
-
-Available tools:
-{tool_names}
-
-Tools and their descriptions:
-{tools}
-
-User Input: {input}
-{agent_scratchpad}
-
-Use this format:
-Action: tool_name
-Action Input: input to tool
-
-Observation: tool response
-
-Thought: Based on the tool response, I will provide a final answer.
-Final Answer: [Your response here]
-"""
+        logger.warning(f"Unknown agent type: {name}")
+        return None
     
     prompt = PromptTemplate(
         template=template,

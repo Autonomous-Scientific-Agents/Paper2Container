@@ -138,3 +138,5 @@ test.pdf
 outputs/
 *.swp
 .DS_Store 
+
+workspaces/

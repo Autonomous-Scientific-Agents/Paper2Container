@@ -4,6 +4,8 @@ import argparse
 import json
 import string
 import random
+import yaml
+import subprocess
 from pathlib import Path
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
@@ -61,9 +63,12 @@ class WorkspaceCreatorTool(BaseTool):
             4. Follow Docker best practices and optimize the build
             5. Ensure all tools from tools_frameworks_mentioned are properly installed and configured
             
-            Respond with ONLY the Dockerfile content, no explanations."""
+            Respond with ONLY the Dockerfile content, no explanations or markdown formatting."""
             
             dockerfile_response = llm.invoke(dockerfile_prompt.format(details=json.dumps(details, indent=2)))
+            
+            # Clean up Dockerfile content
+            dockerfile_content = self._clean_content(dockerfile_response.content)
             
             # Generate docker-compose.yml with focus on tools and frameworks
             compose_prompt = """Create a docker-compose.yml file based on the following development details, ensuring all tools and frameworks are properly integrated:
@@ -76,16 +81,25 @@ class WorkspaceCreatorTool(BaseTool):
             4. Include environment variables needed by the tools and frameworks
             5. Add any necessary dependent services for the tools_frameworks_mentioned
             
-            Respond with ONLY the docker-compose.yml content, no explanations."""
+            Respond with ONLY the docker-compose.yml content, no explanations or markdown formatting."""
             
             compose_response = llm.invoke(compose_prompt.format(details=json.dumps(details, indent=2)))
             
+            # Clean up docker-compose.yml content
+            compose_content = self._clean_content(compose_response.content)
+            
+            # Validate YAML content
+            try:
+                yaml.safe_load(compose_content)
+            except yaml.YAMLError as e:
+                raise ValueError(f"Invalid docker-compose.yml format: {str(e)}")
+            
             # Write files
             with open(os.path.join(workspace_path, 'Dockerfile'), 'w') as f:
-                f.write(dockerfile_response.content)
+                f.write(dockerfile_content)
             
             with open(os.path.join(workspace_path, 'docker-compose.yml'), 'w') as f:
-                f.write(compose_response.content)
+                f.write(compose_content)
             
             return json.dumps({
                 "status": "success",
@@ -100,7 +114,23 @@ class WorkspaceCreatorTool(BaseTool):
                 "error": str(e)
             }, indent=2)
     
-    async def _arun(self, query: str) -> str:
+    def _clean_content(self, content: str) -> str:
+        """Clean up the generated content by removing markdown artifacts and unnecessary formatting."""
+        # Remove markdown code block markers
+        content = re.sub(r'```[\w]*\n?', '', content)
+        
+        # Remove trailing backticks
+        content = content.strip('`').strip()
+        
+        # Remove any yaml: prefix that might appear
+        content = re.sub(r'^yaml:\s*\n', '', content)
+        
+        # Remove version declaration from docker-compose.yml
+        content = re.sub(r'^version:\s*["\']?[0-9\.]+["\']?\s*\n', '', content)
+        
+        return content
+
+async def _arun(self, query: str) -> str:
         raise NotImplementedError("Async version not implemented")
 
 class PaperValidatorTool(BaseTool):
@@ -258,6 +288,92 @@ Required JSON structure:
     async def _arun(self, query: str) -> str:
         raise NotImplementedError("Async version not implemented")
 
+class WorkspaceSyntaxValidator(BaseTool):
+    name = "workspace_syntax_validator"
+    description = "Validates the syntax of Dockerfile and docker-compose.yml files without using LLM"
+    
+    def _clean_yaml_content(self, content: str) -> str:
+        # Remove markdown artifacts and clean YAML content
+        content = re.sub(r'```(?:yaml)?\s*', '', content)
+        content = re.sub(r'`.*?`', '', content)
+        return content.strip()
+    
+    def _run(self, workspace_path: str) -> str:
+        try:
+            # Clean and validate the workspace path
+            workspace_path = str(workspace_path).strip()
+            if not os.path.exists(workspace_path):
+                raise FileNotFoundError(f"Workspace directory not found: {workspace_path}")
+            
+            validation_results = {
+                "dockerfile": {"exists": False, "valid": False, "errors": []},
+                "docker_compose": {"exists": False, "valid": False, "errors": []}
+            }
+            
+            # Check Dockerfile
+            dockerfile_path = os.path.join(workspace_path, 'Dockerfile')
+            if os.path.exists(dockerfile_path):
+                validation_results["dockerfile"]["exists"] = True
+                try:
+                    # Use docker CLI to validate Dockerfile syntax
+                    result = subprocess.run(
+                        ['docker', 'build', '--no-cache', '--quiet', '-f', dockerfile_path, '-t', 'syntax_check', '.'],
+                        cwd=workspace_path,
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        validation_results["dockerfile"]["valid"] = True
+                    else:
+                        validation_results["dockerfile"]["errors"].append(result.stderr)
+                except Exception as e:
+                    validation_results["dockerfile"]["errors"].append(str(e))
+            
+            # Check docker-compose.yml
+            compose_path = os.path.join(workspace_path, 'docker-compose.yml')
+            if os.path.exists(compose_path):
+                validation_results["docker_compose"]["exists"] = True
+                try:
+                    # Read and clean YAML content
+                    with open(compose_path, 'r') as f:
+                        content = f.read()
+                    
+                    cleaned_content = self._clean_yaml_content(content)
+                    yaml_data = yaml.safe_load(cleaned_content)
+                    
+                    # Check for deprecated version key
+                    if 'version' in yaml_data:
+                        validation_results["docker_compose"]["errors"].append("The 'version' key is deprecated in recent Docker Compose versions and should be removed")
+                    
+                    # Then use docker-compose CLI to validate configuration
+                    result = subprocess.run(
+                        ['docker-compose', 'config', '-q'],
+                        cwd=workspace_path,
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        validation_results["docker_compose"]["valid"] = True
+                    else:
+                        validation_results["docker_compose"]["errors"].append(result.stderr)
+                except yaml.YAMLError as e:
+                    validation_results["docker_compose"]["errors"].append(f"YAML syntax error: {str(e)}")
+                except Exception as e:
+                    validation_results["docker_compose"]["errors"].append(str(e))
+            
+            return json.dumps(validation_results, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error in WorkspaceSyntaxValidator: {str(e)}")
+            return json.dumps({
+                "error": str(e),
+                "dockerfile": {"exists": False, "valid": False, "errors": [str(e)]},
+                "docker_compose": {"exists": False, "valid": False, "errors": [str(e)]}
+            }, indent=2)
+    
+    async def _arun(self, query: str) -> str:
+        raise NotImplementedError("Async version not implemented")
+
 def create_agent(name: str):
     # Create LLM model
     llm = ChatGoogleGenerativeAI(
@@ -324,6 +440,35 @@ def create_agent(name: str):
         Observation: [TOOL_RESPONSE]
         
         Thought: Workspace creation is complete. I will return the results.
+        Final Answer: [TOOL_RESPONSE]
+        """
+    elif name == "WorkspaceSyntaxValidator":
+        tools = [WorkspaceSyntaxValidator()]
+        template = """You are a Workspace Syntax Validator specialized in checking Docker configuration files.
+        Your task is to validate the syntax of Dockerfile and docker-compose.yml files in a workspace.
+        
+        Available tools:
+        {tool_names}
+        
+        Tools and their descriptions:
+        {tools}
+        
+        User Input: {input}
+        {agent_scratchpad}
+        
+        Follow these steps exactly:
+        1. Extract the workspace path from the input
+        2. Use the workspace_syntax_validator tool with the workspace path
+        3. Return the validation results immediately after receiving a response
+        4. Do not make additional validation calls
+        
+        Use this format EXACTLY:
+        Action: workspace_syntax_validator
+        Action Input: [WORKSPACE_PATH]
+        
+        Observation: [TOOL_RESPONSE]
+        
+        Thought: Syntax validation is complete. I will return the results.
         Final Answer: [TOOL_RESPONSE]
         """
     else:

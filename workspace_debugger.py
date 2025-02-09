@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import subprocess
+import re
 from typing import Dict, List, Optional, Tuple
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import BaseTool
@@ -17,13 +18,17 @@ class WorkspaceDebugger(BaseTool):
     def __init__(self, google_api_key: str, interactive: bool = True):
         super().__init__()
         self.interactive = interactive
-        self.google_api_key = google_api_key
+        self._google_api_key = google_api_key  # Özel değişken olarak tanımla
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-pro-exp-02-05",
             google_api_key=google_api_key,
             convert_system_message_to_human=True,
             temperature=0.1
         )
+
+    @property
+    def google_api_key(self) -> str:
+        return self._google_api_key  # Özel değişkeni döndür
     
     def _run(self, workspace_path: str) -> str:
         try:
@@ -192,8 +197,10 @@ class WorkspaceDebugger(BaseTool):
                     compose_content = f.read()
             
             # Prepare prompt for LLM
-            fix_prompt = f"""Analyze these Docker configuration errors and suggest fixes:
-            
+            fix_prompt = f"""Analyze these Docker configuration errors and suggest fixes.
+
+IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text, explanations, or markdown formatting.
+
 Errors:
 {json.dumps(errors, indent=2)}
 
@@ -203,15 +210,15 @@ Current Dockerfile:
 Current docker-compose.yml:
 {compose_content}
 
-Provide ONLY a JSON response with fixes in this format:
+Required JSON structure:
 {{
     "dockerfile_changes": {{
-        "content": "updated content" or null if no changes
+        "content": "<updated content or null if no changes>"
     }},
     "compose_changes": {{
-        "content": "updated content" or null if no changes
+        "content": "<updated content or null if no changes>"
     }},
-    "explanation": "brief explanation of fixes"
+    "explanation": "<brief explanation of fixes>"
 }}"""
             
             # Get fix suggestions from LLM with error handling
@@ -223,7 +230,25 @@ Provide ONLY a JSON response with fixes in this format:
                 
                 # Clean and parse response
                 cleaned_response = response.content.strip()
-                fixes = json.loads(cleaned_response)
+                # Remove any markdown code block markers
+                cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response)
+                cleaned_response = cleaned_response.replace('```', '')
+                # Remove any leading/trailing whitespace and normalize newlines
+                cleaned_response = cleaned_response.strip()
+                
+                # Try to find JSON in the cleaned response
+                json_pattern = r'({[\s\S]*})'
+                match = re.search(json_pattern, cleaned_response)
+                if not match:
+                    logger.warning(f"Could not find JSON in response: {cleaned_response}")
+                    return {"fixed": False, "changes": "Invalid response format from LLM"}
+                
+                json_str = match.group(1)
+                try:
+                    fixes = json.loads(json_str)
+                except json.JSONDecodeError as je:
+                    logger.error(f"Failed to parse JSON: {str(je)}")
+                    return {"fixed": False, "changes": f"Invalid JSON: {str(je)}"}
                 
                 changes_made = False
                 

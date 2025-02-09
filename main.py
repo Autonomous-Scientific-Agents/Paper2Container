@@ -220,86 +220,95 @@ class WorkspaceDebugger(BaseTool):
                 with open(compose_path, 'r') as f:
                     compose_content = f.read()
             
-            # Prepare prompt for LLM
-            fix_prompt = f"""Analyze these Docker configuration errors and suggest fixes.
+            # Prepare prompt for LLM with structured format
+            fix_prompt = f"""You are a Docker configuration debugging expert. Analyze the provided errors and configuration files, then suggest fixes.
 
-IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text, explanations, or markdown formatting.
+Context:
+- Dockerfile content: {dockerfile_content if dockerfile_content else "Not present"}
+- docker-compose.yml content: {compose_content if compose_content else "Not present"}
+- Errors encountered: {json.dumps(errors, indent=2)}
 
-Errors:
-{json.dumps(errors, indent=2)}
+Instructions:
+1. Analyze the errors and identify their root causes
+2. Determine which files need modifications
+3. Provide specific fixes while maintaining the original configuration structure
+4. Ensure all changes are compatible with Docker best practices
 
-Current Dockerfile:
-{dockerfile_content}
+IMPORTANT: You MUST respond with ONLY a valid JSON object in the following format:
 
-Current docker-compose.yml:
-{compose_content}
-
-Required JSON structure:
 {{
-    "dockerfile_changes": {{
-        "content": "<updated content or null if no changes>"
+    "analysis": {{
+        "error_type": "<error classification>",
+        "root_cause": "<identified root cause>",
+        "affected_files": ["<list of affected files>"]
     }},
-    "compose_changes": {{
-        "content": "<updated content or null if no changes>"
+    "fixes": {{
+        "dockerfile": {{
+            "needs_update": <boolean>,
+            "content": "<complete updated content or null if no changes>"
+        }},
+        "docker_compose": {{
+            "needs_update": <boolean>,
+            "content": "<complete updated content or null if no changes>"
+        }}
     }},
-    "explanation": "<brief explanation of fixes>"
-}}"""
+    "explanation": "<brief explanation of the fixes applied>",
+    "recommendations": [
+        "<list of additional recommendations for preventing similar issues>"
+    ]
+}}
+
+NO additional text, explanations, or markdown formatting should be included."""
             
-            # Get fix suggestions from LLM with error handling and retries
+            # Get fix suggestions with retries
             max_retries = 3
             retry_delay = 2
             
             for attempt in range(max_retries):
                 try:
                     response = self.llm.invoke(fix_prompt)
-                    if not response:
+                    if not response or not response.content:
                         logger.warning(f"Empty response from LLM on attempt {attempt + 1}")
                         if attempt < max_retries - 1:
                             time.sleep(retry_delay * (attempt + 1))
                             continue
                         return {"fixed": False, "changes": "Empty response from LLM after retries"}
                     
-                    if not hasattr(response, 'content') or not response.content:
-                        logger.warning(f"Invalid response format from LLM on attempt {attempt + 1}")
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay * (attempt + 1))
-                            continue
-                        return {"fixed": False, "changes": "Invalid response format from LLM"}
-                    
                     # Clean and parse response
                     cleaned_response = response.content.strip()
-                    # Remove any markdown code block markers
                     cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response)
-                    cleaned_response = cleaned_response.replace('```', '')
-                    cleaned_response = cleaned_response.strip()
+                    cleaned_response = cleaned_response.replace('```', '').strip()
                     
-                    try:
-                        fixes = json.loads(cleaned_response)
-                        changes_made = False
-                        
-                        # Apply fixes to Dockerfile
-                        if fixes.get("dockerfile_changes", {}).get("content"):
-                            with open(dockerfile_path, 'w') as f:
-                                f.write(fixes["dockerfile_changes"]["content"])
-                            changes_made = True
-                        
-                        # Apply fixes to docker-compose.yml
-                        if fixes.get("compose_changes", {}).get("content"):
-                            with open(compose_path, 'w') as f:
-                                f.write(fixes["compose_changes"]["content"])
-                            changes_made = True
-                        
-                        return {
-                            "fixed": changes_made,
-                            "changes": fixes.get("explanation", "No changes made")
+                    fixes = json.loads(cleaned_response)
+                    changes_made = False
+                    
+                    # Apply fixes based on the structured response
+                    if fixes["fixes"]["dockerfile"]["needs_update"] and fixes["fixes"]["dockerfile"]["content"]:
+                        with open(dockerfile_path, 'w') as f:
+                            f.write(fixes["fixes"]["dockerfile"]["content"])
+                        changes_made = True
+                    
+                    if fixes["fixes"]["docker_compose"]["needs_update"] and fixes["fixes"]["docker_compose"]["content"]:
+                        with open(compose_path, 'w') as f:
+                            f.write(fixes["fixes"]["docker_compose"]["content"])
+                        changes_made = True
+                    
+                    return {
+                        "fixed": changes_made,
+                        "changes": {
+                            "analysis": fixes["analysis"],
+                            "explanation": fixes["explanation"],
+                            "recommendations": fixes["recommendations"]
                         }
-                    except json.JSONDecodeError as je:
-                        logger.error(f"Failed to parse JSON on attempt {attempt + 1}: {str(je)}")
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay * (attempt + 1))
-                            continue
-                        return {"fixed": False, "changes": f"Invalid JSON: {str(je)}"}
-                        
+                    }
+                    
+                except json.JSONDecodeError as je:
+                    logger.error(f"Failed to parse JSON on attempt {attempt + 1}: {str(je)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    return {"fixed": False, "changes": f"Invalid JSON response: {str(je)}"}
+                
                 except Exception as e:
                     logger.error(f"Error in LLM processing on attempt {attempt + 1}: {str(e)}")
                     if attempt < max_retries - 1:
@@ -344,18 +353,21 @@ class WorkspaceCreatorTool(BaseTool):
                 temperature=0.1
             )
             
-            # Generate Dockerfile with focus on tools and frameworks
-            dockerfile_prompt = """Create a Dockerfile based on the following development details, with special focus on the tools and frameworks mentioned:
+            # Generate Dockerfile.R with focus on tools and frameworks
+            dockerfile_prompt = """Create a Dockerfile.R based on the following development details, with special focus on the tools and frameworks mentioned:
             {details}
             
-            The Dockerfile should:
-            1. Use the most appropriate base image based on the tools_frameworks_mentioned
-            2. Install all necessary tools and frameworks listed in tools_frameworks_mentioned
-            3. Set up the development environment with proper versions and configurations
-            4. Follow Docker best practices and optimize the build
-            5. Ensure all tools from tools_frameworks_mentioned are properly installed and configured
+            The Dockerfile.R should:
+            1. Use rocker/r-ver:4.3.1 as the base image
+            2. Install all necessary system dependencies for R packages
+            3. Install the following R packages with specific versions:
+               - pso (latest version)
+               - xgboost (latest version)
+               - any additional packages needed for the tools mentioned
+            4. Set up proper working directory and file structure
+            5. Follow Docker best practices and optimize the build
             
-            Respond with ONLY the Dockerfile content, no explanations or markdown formatting."""
+            Respond with ONLY the Dockerfile.R content, no explanations or markdown formatting."""
             
             dockerfile_response = llm.invoke(dockerfile_prompt.format(details=json.dumps(details, indent=2)))
             
@@ -367,11 +379,16 @@ class WorkspaceCreatorTool(BaseTool):
             {details}
             
             The docker-compose.yml should:
-            1. Define services based on the tools_frameworks_mentioned
-            2. Set up appropriate volumes for development
-            3. Configure networking for all required services
-            4. Include environment variables needed by the tools and frameworks
-            5. Add any necessary dependent services for the tools_frameworks_mentioned
+            1. Define a service named 'r-environment' that uses Dockerfile.R
+            2. Set up the following volume mounts:
+               - ./src:/app/src (for source code)
+               - ./data:/app/data (for data files)
+               - ./results:/app/results (for output)
+            3. Configure environment variables:
+               - R_LIBS_USER=/usr/local/lib/R/site-library
+            4. Set up networking with 'patternchrome_network'
+            5. Set working directory to /app
+            6. Add a command to run the main R script
             
             Respond with ONLY the docker-compose.yml content, no explanations or markdown formatting."""
             
@@ -387,11 +404,26 @@ class WorkspaceCreatorTool(BaseTool):
                 raise ValueError(f"Invalid docker-compose.yml format: {str(e)}")
             
             # Write files
-            with open(os.path.join(workspace_path, 'Dockerfile'), 'w') as f:
+            with open(os.path.join(workspace_path, 'Dockerfile.R'), 'w') as f:
                 f.write(dockerfile_content)
             
             with open(os.path.join(workspace_path, 'docker-compose.yml'), 'w') as f:
                 f.write(compose_content)
+            
+            # Create necessary directories
+            os.makedirs(os.path.join(workspace_path, 'src'), exist_ok=True)
+            os.makedirs(os.path.join(workspace_path, 'data'), exist_ok=True)
+            os.makedirs(os.path.join(workspace_path, 'results'), exist_ok=True)
+            
+            # Create a basic R script
+            with open(os.path.join(workspace_path, 'src', 'main.R'), 'w') as f:
+                f.write("""# Main R script for PatternChrome
+library(pso)
+library(xgboost)
+
+# Your code will go here
+print("PatternChrome environment initialized successfully!")
+""")
             
             # Run workspace debugger after creation
             debugger = WorkspaceDebugger(interactive=False)
@@ -400,7 +432,7 @@ class WorkspaceCreatorTool(BaseTool):
             return json.dumps({
                 "status": "success",
                 "workspace_path": workspace_path,
-                "files_created": ["Dockerfile", "docker-compose.yml"],
+                "files_created": ["Dockerfile.R", "docker-compose.yml", "src/main.R"],
                 "debug_result": debug_result
             }, indent=2)
             

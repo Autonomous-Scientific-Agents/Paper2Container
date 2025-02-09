@@ -353,11 +353,11 @@ class WorkspaceCreatorTool(BaseTool):
                 temperature=0.1
             )
             
-            # Generate Dockerfile.R with focus on tools and frameworks
-            dockerfile_prompt = """Create a Dockerfile.R based on the following development details, with special focus on the tools and frameworks mentioned:
+            # Generate Dockerfile with focus on R environment
+            dockerfile_prompt = """Create a Dockerfile for an R environment based on the following development details:
             {details}
             
-            The Dockerfile.R should:
+            The Dockerfile should:
             1. Use rocker/r-ver:4.3.1 as the base image
             2. Install all necessary system dependencies for R packages
             3. Install the following R packages with specific versions:
@@ -367,7 +367,7 @@ class WorkspaceCreatorTool(BaseTool):
             4. Set up proper working directory and file structure
             5. Follow Docker best practices and optimize the build
             
-            Respond with ONLY the Dockerfile.R content, no explanations or markdown formatting."""
+            Respond with ONLY the Dockerfile content, no explanations or markdown formatting."""
             
             dockerfile_response = llm.invoke(dockerfile_prompt.format(details=json.dumps(details, indent=2)))
             
@@ -379,7 +379,7 @@ class WorkspaceCreatorTool(BaseTool):
             {details}
             
             The docker-compose.yml should:
-            1. Define a service named 'r-environment' that uses Dockerfile.R
+            1. Define a service named 'r-environment' that uses Dockerfile
             2. Set up the following volume mounts:
                - ./src:/app/src (for source code)
                - ./data:/app/data (for data files)
@@ -404,26 +404,11 @@ class WorkspaceCreatorTool(BaseTool):
                 raise ValueError(f"Invalid docker-compose.yml format: {str(e)}")
             
             # Write files
-            with open(os.path.join(workspace_path, 'Dockerfile.R'), 'w') as f:
+            with open(os.path.join(workspace_path, 'Dockerfile'), 'w') as f:
                 f.write(dockerfile_content)
             
             with open(os.path.join(workspace_path, 'docker-compose.yml'), 'w') as f:
                 f.write(compose_content)
-            
-            # Create necessary directories
-            os.makedirs(os.path.join(workspace_path, 'src'), exist_ok=True)
-            os.makedirs(os.path.join(workspace_path, 'data'), exist_ok=True)
-            os.makedirs(os.path.join(workspace_path, 'results'), exist_ok=True)
-            
-            # Create a basic R script
-            with open(os.path.join(workspace_path, 'src', 'main.R'), 'w') as f:
-                f.write("""# Main R script for PatternChrome
-library(pso)
-library(xgboost)
-
-# Your code will go here
-print("PatternChrome environment initialized successfully!")
-""")
             
             # Run workspace debugger after creation
             debugger = WorkspaceDebugger(interactive=False)
@@ -432,7 +417,7 @@ print("PatternChrome environment initialized successfully!")
             return json.dumps({
                 "status": "success",
                 "workspace_path": workspace_path,
-                "files_created": ["Dockerfile.R", "docker-compose.yml", "src/main.R"],
+                "files_created": ["Dockerfile", "docker-compose.yml"],
                 "debug_result": debug_result
             }, indent=2)
             

@@ -44,7 +44,7 @@ class WorkspaceCreatorTool(BaseTool):
             
             # Create LLM instance for file generation
             llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-pro-exp-02-05",
+                model="gemini-pro",
                 google_api_key=GOOGLE_API_KEY,
                 convert_system_message_to_human=True,
                 temperature=0.1
@@ -129,12 +129,18 @@ class PaperValidatorTool(BaseTool):
                 raise ValueError("PDF content is empty")
 
             # Create LLM instance for validation with increased timeout
+            # Add gRPC environment variable at the top after imports
+            os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '1'
+            os.environ['GRPC_POLL_STRATEGY'] = 'epoll1'
+            
+            # Update timeout and add retry logic in PaperValidatorTool._run
             llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-pro-exp-02-05",
+                model="gemini-pro",
                 google_api_key=GOOGLE_API_KEY,
                 convert_system_message_to_human=True,
                 temperature=0.1,
-                timeout=120  # 2 dakika timeout
+                timeout=180,  # Increased timeout to 3 minutes
+                max_retries=3  # Add retries for resilience
             )
             
             # Log the content length for debugging
@@ -173,12 +179,51 @@ Required JSON structure:
             logger.debug(f"Raw LLM response: {response.content}")
             
             # Clean and parse response
-            cleaned_response = response.content.strip()
-            
+            # Improve JSON response handling
             try:
-                # Direct JSON parsing
-                json_obj = json.loads(cleaned_response)
+                # Direct JSON parsing with better error handling
+                cleaned_response = response.content.strip()
+                
+                # First try: direct parsing after basic cleaning
+                try:
+                    # Remove any leading/trailing whitespace and common formatting characters
+                    cleaned_response = re.sub(r'^[\s\n\r]*|[\s\n\r]*$', '', cleaned_response)
+                    cleaned_response = re.sub(r'^["\'`]|["\'`]$', '', cleaned_response)
+                    json_obj = json.loads(cleaned_response)
+                except json.JSONDecodeError:
+                    # Second try: remove markdown and code block markers
+                    cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response, flags=re.DOTALL)
+                    cleaned_response = re.sub(r'`.*?`', '', cleaned_response)
+                    cleaned_response = re.sub(r'[\n\r\t]+', ' ', cleaned_response)
+                    
+                    try:
+                        json_obj = json.loads(cleaned_response)
+                    except json.JSONDecodeError:
+                        # Third try: extract JSON using more aggressive pattern matching
+                        json_patterns = [
+                            r'\{[^{}]*\}',  # Simple JSON object
+                            r'\{(?:[^{}]|\{[^{}]*\})*\}',  # Nested JSON object
+                            r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}'  # Deeply nested JSON
+                        ]
+                        
+                        for pattern in json_patterns:
+                            matches = re.finditer(pattern, cleaned_response)
+                            for match in matches:
+                                try:
+                                    potential_json = match.group(0)
+                                    json_obj = json.loads(potential_json)
+                                    if all(key in json_obj for key in ['is_computational_science', 'has_development_info', 'paper_type']):
+                                        return json.dumps(json_obj, indent=2)
+                                except:
+                                    continue
+                        
+                        raise ValueError("Could not extract valid JSON from response")
+                
                 return json.dumps(json_obj, indent=2)
+                
+            except Exception as e:
+                logger.error(f"Error in JSON parsing: {str(e)}")
+                raise ValueError(f"Failed to parse response: {str(e)}")
             except json.JSONDecodeError as je:
                 logger.warning(f"Initial JSON parsing failed: {str(je)}")
                 
@@ -227,7 +272,7 @@ Required JSON structure:
 def create_agent(name: str):
     # Create LLM model
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-pro-exp-02-05",
+        model="gemini-pro",
         google_api_key=GOOGLE_API_KEY,
         convert_system_message_to_human=True,
         temperature=0.1
@@ -251,7 +296,8 @@ def create_agent(name: str):
         Follow these steps exactly:
         1. Extract the PDF file path from the user input
         2. Use the paper_validator tool with ONLY the file path
-        3. Return ONLY the JSON response from the tool
+        3. If you receive a valid JSON response, return it immediately
+        4. Do not make additional validation calls if you already have a valid response
         
         Use this format EXACTLY:
         Action: paper_validator
@@ -259,7 +305,7 @@ def create_agent(name: str):
         
         Observation: [TOOL_RESPONSE]
         
-        Thought: I will now return the JSON response directly.
+        Thought: I have received a valid response and will return it.
         Final Answer: [TOOL_RESPONSE]
         """
     elif name == "WorkspaceCreator":
@@ -278,8 +324,9 @@ def create_agent(name: str):
         
         Follow these steps exactly:
         1. Parse the development details from the input JSON
-        2. Use the workspace_creator tool with ONLY the development_details section
-        3. Return the workspace creation results
+        2. Use the workspace_creator tool with the development details
+        3. Return the workspace creation results immediately after receiving a response
+        4. Do not make additional workspace creation calls
         
         Use this format EXACTLY:
         Action: workspace_creator
@@ -287,7 +334,7 @@ def create_agent(name: str):
         
         Observation: [TOOL_RESPONSE]
         
-        Thought: Workspace creation is complete.
+        Thought: Workspace creation is complete. I will return the results.
         Final Answer: [TOOL_RESPONSE]
         """
     else:
@@ -307,10 +354,11 @@ def create_agent(name: str):
         agent=agent,
         tools=tools,
         verbose=True,
-        max_iterations=3,
-        max_execution_time=300,
+        max_iterations=2,  # Reduced from 5 to 2 since we only need one validation
+        max_execution_time=300,  # Reduced timeout to 5 minutes
         handle_parsing_errors=True,
-        early_stopping_method="force"
+        early_stopping_method="force",  # Changed from generate to force for compatibility
+        return_intermediate_steps=True
     )
     
     return agent_executor
@@ -394,62 +442,56 @@ def main():
         if not paper_response:
             raise ValueError("No response received from PaperReader")
             
-        # Try to extract output from paper_response
+        # Extract output from paper_response
         output = paper_response.get('output', '')
         
         # Try to find JSON in the output
-        json_str = None
-        
-        # Remove any ANSI escape codes and other non-printable characters
-        output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
-        output = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', output)
-        
-        # First, try to find JSON in the Final Answer section
-        final_answer_match = re.search(r'Final Answer:\s*({[\s\S]*?})\s*$', output)
-        if final_answer_match:
-            json_str = final_answer_match.group(1).strip()
-            logger.info("Found JSON in Final Answer section")
-        
-        # If not found in Final Answer, try Observation
-        if not json_str:
-            observation_match = re.search(r'Observation:\s*({[\s\S]*?})\s*(?:Thought:|$)', output)
-            if observation_match:
-                json_str = observation_match.group(1).strip()
-                logger.info("Found JSON in Observation section")
-        
-        # If still not found, try to find any JSON-like structure
-        if not json_str:
-            json_match = re.search(r'({[\s\S]*?"is_computational_science"[\s\S]*?})', output)
-            if json_match:
-                json_str = json_match.group(1).strip()
-                logger.info("Found JSON in raw output")
-        
+        validation_result = None
         try:
-            if json_str:
-                # Try to extract and parse JSON
-                try:
-                    json_str = extract_json_from_text(json_str)
-                    validation_result = json.loads(json_str)
-                    logger.info("Successfully parsed JSON response")
-                except (ValueError, json.JSONDecodeError) as e:
-                    logger.warning(f"Failed to parse JSON from string: {str(e)}")
-                    # Try with raw output
-                    json_str = extract_json_from_text(output)
-                    validation_result = json.loads(json_str)
-                    logger.info("Successfully parsed JSON from raw output")
-            else:
-                # Try to parse the raw output
-                json_str = extract_json_from_text(output)
-                validation_result = json.loads(json_str)
-                logger.info("Successfully parsed JSON from raw output")
+            # Find the first occurrence of a complete JSON object
+            json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
+            match = re.search(json_pattern, output)
+            if match:
+                validation_result = json.loads(match.group(1))
+                logger.info("Successfully parsed JSON from output")
         except Exception as e:
             logger.error(f"Failed to parse JSON: {str(e)}")
-            print("\nError: Failed to parse JSON response")
+            print(f"\nError: Failed to parse validation response")
             print(f"Error details: {str(e)}")
-            if json_str:
-                print("\nAttempted JSON string:")
-                print("-" * 50)
-                print(json_str)
+            return
+            
+        if not validation_result:
+            logger.error("No valid JSON object found in response")
+            print("\nError: Invalid validation response format")
+            return
+        
+        # Try to extract output from paper_response using a more direct approach
+        validation_result = None
+        
+        # First try: Look for a complete JSON object
+        try:
+            # Find the first occurrence of a complete JSON object
+            json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
+            match = re.search(json_pattern, output)
+            if match:
+                potential_json = match.group(1)
+                validation_result = json.loads(potential_json)
+                logger.info("Successfully parsed JSON directly from output")
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning(f"First JSON parsing attempt failed: {str(e)}")
+        
+        # If direct parsing failed, try the existing extraction method
+        if not validation_result:
+            try:
+                validation_result = json.loads(extract_json_from_text(output))
+                logger.info("Successfully parsed JSON using extraction method")
+            except Exception as e:
+                logger.warning(f"JSON extraction failed: {str(e)}")
+        
+        if not validation_result:
+            logger.error("Failed to parse JSON: No valid JSON object found")
+            print("\nError: Failed to parse JSON response")
+            print("Error details: No valid JSON object found")
             print("\nRaw output:")
             print("-" * 50)
             print(output)
@@ -463,55 +505,56 @@ def main():
         print("-" * 50)
         
         # Check if we should create workspace
-        if validation_result.get("has_development_info", False):
+        if validation_result.get("has_development_info", False) and validation_result.get("development_details"):
             logger.info("Paper has sufficient development information. Creating workspace...")
             
             # Extract development details
-            dev_details = validation_result.get("development_details", {})
-            if not dev_details:
-                logger.warning("Development details section is empty")
-                print("\nNote: Workspace not created due to empty development details")
-                return
-                
+            dev_details = validation_result.get("development_details")
+            
             # Create workspace with WorkspaceCreator
             workspace_creator = create_agent("WorkspaceCreator")
-            workspace_response = workspace_creator.invoke({
-                "input": json.dumps({
-                    "tools": dev_details.get("tools_frameworks_mentioned", []),
-                    "implementation_details": dev_details.get("implementation_details", False),
-                    "methodology_explained": dev_details.get("methodology_explained", False),
-                    "paper_type": validation_result.get("paper_type", "Unknown"),
-                    "summary": validation_result.get("summary", ""),
-                    "missing_critical_info": dev_details.get("missing_critical_info", [])
-                })
-            })
             
-            # Try to extract JSON from workspace response
-            workspace_result = None
-            try:
-                if isinstance(workspace_response, dict) and 'output' in workspace_response:
-                    output = workspace_response['output']
-                    # Try to find JSON in the output
-                    json_match = re.search(r'({[\s\S]*})\s*$', output)
-                    if json_match:
-                        workspace_result = json.loads(json_match.group(1).strip())
+            # Prepare development details as a clean JSON string
+            development_details = {
+                "tools": dev_details.get("tools_frameworks_mentioned", []),
+                "implementation_details": dev_details.get("implementation_details", False),
+                "methodology_explained": dev_details.get("methodology_explained", False),
+                "paper_type": validation_result.get("paper_type", "Unknown"),
+                "summary": validation_result.get("summary", ""),
+                "missing_critical_info": dev_details.get("missing_critical_info", [])
+            }
+            
+            # Convert to a clean JSON string
+            dev_details_str = json.dumps(development_details, ensure_ascii=False, indent=None)
+            
+            logger.info(f"Sending development details to workspace creator: {dev_details_str}")
+            
+            # Invoke workspace creator with the clean JSON string
+            workspace_response = workspace_creator.invoke({"input": dev_details_str})
+            
+            # Process workspace response
+            if isinstance(workspace_response, dict) and 'output' in workspace_response:
+                output = workspace_response['output']
+                
+                # Try to find JSON in the output using the same pattern as before
+                try:
+                    json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
+                    match = re.search(json_pattern, output)
+                    if match:
+                        workspace_result = json.loads(match.group(1))
+                        logger.info("Successfully parsed workspace creation result")
                     else:
                         workspace_result = {"status": "error", "message": "Could not extract JSON from response"}
-                else:
-                    workspace_result = {"status": "error", "message": "Invalid workspace response format"}
-            except Exception as e:
-                workspace_result = {"status": "error", "message": str(e)}
-            
-            if workspace_result:
-                print("\nWorkspace Creation Results:")
-                print("-" * 50)
-                print(json.dumps(workspace_result, indent=2))
-                print("-" * 50)
+                except Exception as e:
+                    workspace_result = {"status": "error", "message": f"Error parsing workspace response: {str(e)}"}
             else:
-                print("\nWorkspace Creation Output:")
-                print("-" * 50)
-                print(workspace_response.get('output', 'No output available'))
-                print("-" * 50)
+                workspace_result = {"status": "error", "message": "Invalid workspace response format"}
+            
+            # Print workspace results
+            print("\nWorkspace Creation Results:")
+            print("-" * 50)
+            print(json.dumps(workspace_result, indent=2))
+            print("-" * 50)
         else:
             logger.info("Paper does not have sufficient development information")
             print("\nNote: Workspace not created due to insufficient development information")

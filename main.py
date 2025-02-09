@@ -17,9 +17,11 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.tools.render import render_text_description
 from langchain.tools import BaseTool
 from langchain.prompts import PromptTemplate
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import re
 import time
+from langchain_community.llms import Ollama
+from langchain.schema.language_model import BaseLanguageModel
 
 # Logging settings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -35,28 +37,22 @@ class WorkspaceDebugger(BaseTool):
     name = "workspace_debugger"
     description = "Debugs and fixes Docker configuration files in a workspace"
     max_retries = 10
-    interactive = True  # Add default class attribute
+    interactive = True
+    llm: Optional[BaseLanguageModel] = None
     
-    def __init__(self, google_api_key: str, interactive: bool = True):
+    def __init__(self, interactive: bool = True):
         super().__init__()
         self.interactive = interactive
-        self._google_api_key = google_api_key  # Özel değişken olarak tanımla
         try:
-            self.llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-pro-exp-02-05",
-                google_api_key=google_api_key,
-                convert_system_message_to_human=True,
-                temperature=0.1,
-                max_retries=3,
-                timeout=180
+            # Initialize Ollama LLM
+            self.llm = Ollama(
+                model="llama3.2",
+                base_url="http://localhost:11434",
+                temperature=0.1
             )
         except Exception as e:
             logger.error(f"Error initializing LLM: {str(e)}")
             raise
-
-    @property
-    def google_api_key(self) -> str:
-        return self._google_api_key
 
     def _run(self, workspace_path: str) -> str:
         try:
@@ -398,7 +394,7 @@ class WorkspaceCreatorTool(BaseTool):
                 f.write(compose_content)
             
             # Run workspace debugger after creation
-            debugger = WorkspaceDebugger(GOOGLE_API_KEY, interactive=False)
+            debugger = WorkspaceDebugger(interactive=False)
             debug_result = json.loads(debugger._run(workspace_path))
             
             return json.dumps({
@@ -441,7 +437,7 @@ class WorkspaceCreatorTool(BaseTool):
         
         return content
 
-async def _arun(self, query: str) -> str:
+    async def _arun(self, query: str) -> str:
         raise NotImplementedError("Async version not implemented")
 
 class PaperValidatorTool(BaseTool):
@@ -538,7 +534,7 @@ Required JSON structure:
                     return json.dumps(json_obj, indent=2)
                 except json.JSONDecodeError:
                     # Third try: extract JSON using regex
-                    json_pattern = r'\{(?:[^{}]|\{[^{}]*\})*\}'
+                    json_pattern = r'\{(?:[^{}]|\{[^{}]*\}[^{}]*)*\}|\{[^}]*}'
                     matches = re.finditer(json_pattern, cleaned_response)
                     
                     for match in matches:
@@ -686,13 +682,21 @@ class WorkspaceSyntaxValidator(BaseTool):
         raise NotImplementedError("Async version not implemented")
 
 def create_agent(name: str):
-    # Create LLM model
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-pro-exp-02-05",
-        google_api_key=GOOGLE_API_KEY,
-        convert_system_message_to_human=True,
-        temperature=0.1
-    )
+    if name == "WorkspaceDebugger":
+        # Use Ollama LLM for WorkspaceDebugger
+        llm = Ollama(
+            model="llama3.2",
+            base_url="http://localhost:11434",
+            temperature=0.1
+        )
+    else:
+        # Use Gemini for other agents
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-pro-exp-02-05",
+            google_api_key=GOOGLE_API_KEY,
+            convert_system_message_to_human=True,
+            temperature=0.1
+        )
     
     # Define tools based on agent name
     if name == "PaperReader":
@@ -784,7 +788,7 @@ def create_agent(name: str):
         Final Answer: [TOOL_RESPONSE]
         """
     elif name == "WorkspaceDebugger":
-        tools = [WorkspaceDebugger(GOOGLE_API_KEY, interactive=False)]
+        tools = [WorkspaceDebugger(interactive=False)]
         template = """You are a Workspace Debugger Assistant specialized in fixing Docker configuration issues.
         Your task is to debug and fix Docker configuration files in a workspace.
         

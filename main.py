@@ -6,6 +6,7 @@ import string
 import random
 import yaml
 import subprocess
+import shutil
 from pathlib import Path
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ from langchain.agents.format_scratchpad import format_log_to_str
 from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.tools.render import render_text_description
 from langchain.tools import BaseTool
+from workspace_debugger import WorkspaceDebugger
 from langchain.prompts import PromptTemplate
 import re
 
@@ -34,12 +36,15 @@ class WorkspaceCreatorTool(BaseTool):
     
     def _run(self, development_details: str) -> str:
         try:
-            # Parse development details
-            details = json.loads(development_details)
+            # Parse development details and clean up any potential trailing data
+            details = json.loads(development_details.split('\n')[0].strip())
             
-            # Create random workspace name
-            workspace_name = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-            workspace_path = os.path.join('workspaces', workspace_name)
+            # Use a fixed workspace name instead of random
+            workspace_path = os.path.join('workspaces', 'current')
+            
+            # Clean up existing workspace if it exists
+            if os.path.exists(workspace_path):
+                shutil.rmtree(workspace_path)
             
             # Create workspace directory
             os.makedirs(workspace_path, exist_ok=True)
@@ -101,10 +106,15 @@ class WorkspaceCreatorTool(BaseTool):
             with open(os.path.join(workspace_path, 'docker-compose.yml'), 'w') as f:
                 f.write(compose_content)
             
+            # Run workspace debugger after creation
+            debugger = WorkspaceDebugger(GOOGLE_API_KEY, interactive=False)
+            debug_result = json.loads(debugger._run(workspace_path))
+            
             return json.dumps({
                 "status": "success",
                 "workspace_path": workspace_path,
-                "files_created": ["Dockerfile", "docker-compose.yml"]
+                "files_created": ["Dockerfile", "docker-compose.yml"],
+                "debug_result": debug_result
             }, indent=2)
             
         except Exception as e:
@@ -116,17 +126,27 @@ class WorkspaceCreatorTool(BaseTool):
     
     def _clean_content(self, content: str) -> str:
         """Clean up the generated content by removing markdown artifacts and unnecessary formatting."""
-        # Remove markdown code block markers
-        content = re.sub(r'```[\w]*\n?', '', content)
+        # Remove any leading/trailing whitespace
+        content = content.strip()
         
-        # Remove trailing backticks
-        content = content.strip('`').strip()
+        # Remove markdown code block markers and language identifiers
+        content = re.sub(r'```(?:dockerfile|yaml|yml)?\s*', '', content)
+        content = re.sub(r'```\s*$', '', content)
         
-        # Remove any yaml: prefix that might appear
-        content = re.sub(r'^yaml:\s*\n', '', content)
+        # Remove any remaining backticks
+        content = content.replace('`', '')
+        
+        # Remove any yaml: or dockerfile: prefix that might appear
+        content = re.sub(r'^(?:yaml|dockerfile):\s*\n', '', content)
         
         # Remove version declaration from docker-compose.yml
         content = re.sub(r'^version:\s*["\']?[0-9\.]+["\']?\s*\n', '', content)
+        
+        # Ensure proper line endings
+        content = content.replace('\r\n', '\n')
+        
+        # Remove any empty lines at the start or end
+        content = content.strip()
         
         return content
 
@@ -434,6 +454,7 @@ def create_agent(name: str):
         4. Do not make additional workspace creation calls
         
         Use this format EXACTLY:
+        Thought: I will create a workspace based on the development details.
         Action: workspace_creator
         Action Input: [DEVELOPMENT_DETAILS_JSON]
         
@@ -469,6 +490,35 @@ def create_agent(name: str):
         Observation: [TOOL_RESPONSE]
         
         Thought: Syntax validation is complete. I will return the results.
+        Final Answer: [TOOL_RESPONSE]
+        """
+    elif name == "WorkspaceDebugger":
+        tools = [WorkspaceDebugger(GOOGLE_API_KEY, interactive=False)]
+        template = """You are a Workspace Debugger Assistant specialized in fixing Docker configuration issues.
+        Your task is to debug and fix Docker configuration files in a workspace.
+        
+        Available tools:
+        {tool_names}
+        
+        Tools and their descriptions:
+        {tools}
+        
+        User Input: {input}
+        {agent_scratchpad}
+        
+        Follow these steps exactly:
+        1. Extract the workspace path from the input
+        2. Use the workspace_debugger tool with the workspace path
+        3. Return the debugging results immediately after receiving a response
+        4. Do not make additional debug calls
+        
+        Use this format EXACTLY:
+        Action: workspace_debugger
+        Action Input: [WORKSPACE_PATH]
+        
+        Observation: [TOOL_RESPONSE]
+        
+        Thought: Debugging is complete. I will return the results.
         Final Answer: [TOOL_RESPONSE]
         """
     else:

@@ -1,5 +1,6 @@
 import os
 import logging
+import argparse
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_react_agent
@@ -77,23 +78,47 @@ Final Answer: [Your response here]
     
     return agent_executor
 
+def validate_pdf_file(file_path: str) -> bool:
+    if not os.path.exists(file_path):
+        return False
+    if not file_path.lower().endswith('.pdf'):
+        return False
+    return True
+
 def main():
+    # Create argument parser
+    parser = argparse.ArgumentParser(description='PDF file processing tool')
+    parser.add_argument('pdf_file', nargs='?', help='Path to the PDF file to process')
+    args = parser.parse_args()
+
     logger.info("Starting application...")
+
+    # PDF file validation
+    if not args.pdf_file:
+        logger.error("Error: No PDF file specified!")
+        print("Usage: python main.py <pdf_file>")
+        return
+
+    if not validate_pdf_file(args.pdf_file):
+        logger.error(f"Error: Invalid PDF file or file not found: {args.pdf_file}")
+        return
+
+    logger.info(f"Processing PDF file: {args.pdf_file}")
     
-    # Create two agents
-    agent1 = create_agent("Agent1")
-    agent2 = create_agent("Agent2")
-    
-    logger.info("Agents created")
-    
-    # Send "hello" message to both agents
+    # Create agents and process the PDF
     try:
+        agent1 = create_agent("Agent1")
+        agent2 = create_agent("Agent2")
+        
+        logger.info("Agents created")
+        
+        # Send PDF processing request to agents
         logger.info("Sending request to Agent1...")
-        response1 = agent1.invoke({"input": "hello"})
+        response1 = agent1.invoke({"input": f"Process this PDF file: {args.pdf_file}"})
         print(f"Agent1 response: {response1['output']}")
         
         logger.info("Sending request to Agent2...")
-        response2 = agent2.invoke({"input": "hello"})
+        response2 = agent2.invoke({"input": f"Process this PDF file: {args.pdf_file}"})
         print(f"Agent2 response: {response2['output']}")
         
     except Exception as e:

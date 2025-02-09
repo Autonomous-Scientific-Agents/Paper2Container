@@ -50,29 +50,31 @@ class WorkspaceCreatorTool(BaseTool):
                 temperature=0.1
             )
             
-            # Generate Dockerfile
-            dockerfile_prompt = """Create a Dockerfile based on the following development details:
+            # Generate Dockerfile with focus on tools and frameworks
+            dockerfile_prompt = """Create a Dockerfile based on the following development details, with special focus on the tools and frameworks mentioned:
             {details}
             
             The Dockerfile should:
-            1. Use appropriate base image
-            2. Install all necessary tools and frameworks
-            3. Set up the development environment
-            4. Follow best practices
+            1. Use the most appropriate base image based on the tools_frameworks_mentioned
+            2. Install all necessary tools and frameworks listed in tools_frameworks_mentioned
+            3. Set up the development environment with proper versions and configurations
+            4. Follow Docker best practices and optimize the build
+            5. Ensure all tools from tools_frameworks_mentioned are properly installed and configured
             
             Respond with ONLY the Dockerfile content, no explanations."""
             
             dockerfile_response = llm.invoke(dockerfile_prompt.format(details=json.dumps(details, indent=2)))
             
-            # Generate docker-compose.yml
-            compose_prompt = """Create a docker-compose.yml file based on the following development details:
+            # Generate docker-compose.yml with focus on tools and frameworks
+            compose_prompt = """Create a docker-compose.yml file based on the following development details, ensuring all tools and frameworks are properly integrated:
             {details}
             
             The docker-compose.yml should:
-            1. Define necessary services
-            2. Set up appropriate volumes
-            3. Configure networking
-            4. Include any required environment variables
+            1. Define services based on the tools_frameworks_mentioned
+            2. Set up appropriate volumes for development
+            3. Configure networking for all required services
+            4. Include environment variables needed by the tools and frameworks
+            5. Add any necessary dependent services for the tools_frameworks_mentioned
             
             Respond with ONLY the docker-compose.yml content, no explanations."""
             
@@ -179,47 +181,34 @@ Required JSON structure:
             logger.debug(f"Raw LLM response: {response.content}")
             
             # Clean and parse response
-            # Improve JSON response handling
+            cleaned_response = response.content.strip()
+            
+            # First try: direct parsing
             try:
-                # Direct JSON parsing with better error handling
-                cleaned_response = response.content.strip()
-                
-                # First try: direct parsing after basic cleaning
+                json_obj = json.loads(cleaned_response)
+                return json.dumps(json_obj, indent=2)
+            except json.JSONDecodeError:
+                # Second try: remove markdown and code block markers
                 try:
-                    # Remove any leading/trailing whitespace and common formatting characters
-                    cleaned_response = re.sub(r'^[\s\n\r]*|[\s\n\r]*$', '', cleaned_response)
-                    cleaned_response = re.sub(r'^["\'`]|["\'`]$', '', cleaned_response)
-                    json_obj = json.loads(cleaned_response)
-                except json.JSONDecodeError:
-                    # Second try: remove markdown and code block markers
-                    cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response, flags=re.DOTALL)
+                    cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response)
                     cleaned_response = re.sub(r'`.*?`', '', cleaned_response)
                     cleaned_response = re.sub(r'[\n\r\t]+', ' ', cleaned_response)
+                    json_obj = json.loads(cleaned_response)
+                    return json.dumps(json_obj, indent=2)
+                except json.JSONDecodeError:
+                    # Third try: extract JSON using regex
+                    json_pattern = r'\{(?:[^{}]|\{[^{}]*\})*\}'
+                    matches = re.finditer(json_pattern, cleaned_response)
                     
-                    try:
-                        json_obj = json.loads(cleaned_response)
-                    except json.JSONDecodeError:
-                        # Third try: extract JSON using more aggressive pattern matching
-                        json_patterns = [
-                            r'\{[^{}]*\}',  # Simple JSON object
-                            r'\{(?:[^{}]|\{[^{}]*\})*\}',  # Nested JSON object
-                            r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}'  # Deeply nested JSON
-                        ]
-                        
-                        for pattern in json_patterns:
-                            matches = re.finditer(pattern, cleaned_response)
-                            for match in matches:
-                                try:
-                                    potential_json = match.group(0)
-                                    json_obj = json.loads(potential_json)
-                                    if all(key in json_obj for key in ['is_computational_science', 'has_development_info', 'paper_type']):
-                                        return json.dumps(json_obj, indent=2)
-                                except:
-                                    continue
-                        
-                        raise ValueError("Could not extract valid JSON from response")
-                
-                return json.dumps(json_obj, indent=2)
+                    for match in matches:
+                        try:
+                            json_obj = json.loads(match.group(0))
+                            if all(key in json_obj for key in ['is_computational_science', 'has_development_info', 'paper_type']):
+                                return json.dumps(json_obj, indent=2)
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    raise ValueError("Could not extract valid JSON from response")
                 
             except Exception as e:
                 logger.error(f"Error in JSON parsing: {str(e)}")
@@ -442,51 +431,97 @@ def main():
         if not paper_response:
             raise ValueError("No response received from PaperReader")
             
-        # Extract output from paper_response
-        output = paper_response.get('output', '')
-        
-        # Try to find JSON in the output
-        validation_result = None
-        try:
-            # Find the first occurrence of a complete JSON object
-            json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
-            match = re.search(json_pattern, output)
-            if match:
-                validation_result = json.loads(match.group(1))
-                logger.info("Successfully parsed JSON from output")
-        except Exception as e:
-            logger.error(f"Failed to parse JSON: {str(e)}")
-            print(f"\nError: Failed to parse validation response")
-            print(f"Error details: {str(e)}")
-            return
+        # Process paper_response
+        if not paper_response or 'output' not in paper_response:
+            raise ValueError("Invalid or empty response from PaperReader")
             
-        if not validation_result:
-            logger.error("No valid JSON object found in response")
-            print("\nError: Invalid validation response format")
-            return
+        output = paper_response['output']
+        logger.debug(f"Raw output from PaperReader: {output}")
         
-        # Try to extract output from paper_response using a more direct approach
+        # Enhanced JSON extraction approach
         validation_result = None
         
-        # First try: Look for a complete JSON object
-        try:
-            # Find the first occurrence of a complete JSON object
-            json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
-            match = re.search(json_pattern, output)
-            if match:
-                potential_json = match.group(1)
-                validation_result = json.loads(potential_json)
-                logger.info("Successfully parsed JSON directly from output")
-        except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"First JSON parsing attempt failed: {str(e)}")
+        # Try multiple JSON extraction methods
+        extraction_methods = [
+            # Method 1: Direct JSON parsing
+            lambda text: json.loads(text) if isinstance(text, str) else None,
+            
+            # Method 2: Extract JSON from markdown code blocks
+            lambda text: json.loads(re.sub(r'```(?:json)?\s*(.+?)\s*```', r'\1', text, flags=re.DOTALL)) if '```' in text else None,
+            
+            # Method 3: Find the last complete JSON object
+            lambda text: next((json.loads(match.group(0)) 
+                for match in reversed(list(re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text))) 
+                if all(key in json.loads(match.group(0)) 
+                    for key in ['is_computational_science', 'has_development_info', 'paper_type'])), None),
+            
+            # Method 4: Use extract_json_from_text function as fallback
+            lambda text: json.loads(extract_json_from_text(text))
+        ]
         
-        # If direct parsing failed, try the existing extraction method
+        # Try each extraction method
+        for extract_method in extraction_methods:
+            try:
+                result = extract_method(output)
+                if result and isinstance(result, dict) and all(key in result for key in ['is_computational_science', 'has_development_info', 'paper_type']):
+                    validation_result = result
+                    logger.info("Successfully extracted and validated JSON response")
+                    break
+            except Exception as e:
+                logger.debug(f"Extraction method failed: {str(e)}")
+                continue
+        
+        if not validation_result:
+            logger.error("Failed to extract valid JSON from response")
+            print("\nError: Could not parse validation response")
+            print(f"Raw output:\n{output}")
+            return
+        
+        # Process the validation result
+        if validation_result['is_computational_science'] and validation_result['has_development_info']:
+            logger.info("Paper validated successfully. Creating workspace...")
+            
+            # Create workspace with development details
+            workspace_creator = create_agent("WorkspaceCreator")
+            workspace_response = workspace_creator.invoke({"input": json.dumps(validation_result['development_details'])})
+            
+            if workspace_response and 'output' in workspace_response:
+                print("\nWorkspace creation results:")
+                print(workspace_response['output'])
+            else:
+                print("\nError: Failed to create workspace")
+        else:
+            print("\nPaper validation results:")
+            print(json.dumps(validation_result, indent=2))
+            
+        # Enhanced JSON extraction approach
+        validation_result = None
+        
+        # First try: Extract the last complete JSON object from the output
+        try:
+            # Look for JSON objects in the response
+            json_matches = list(re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', output))
+            if json_matches:
+                # Get the last match as it's likely the final response
+                last_json = json_matches[-1].group(0)
+                potential_result = json.loads(last_json)
+                # Verify it has the expected structure
+                if all(key in potential_result for key in ['is_computational_science', 'has_development_info', 'paper_type']):
+                    validation_result = potential_result
+                    logger.info("Successfully parsed JSON from output using pattern matching")
+        except Exception as e:
+            logger.warning(f"Pattern matching JSON extraction failed: {str(e)}")
+        
+        # Second try: Use the extract_json_from_text function
         if not validation_result:
             try:
-                validation_result = json.loads(extract_json_from_text(output))
-                logger.info("Successfully parsed JSON using extraction method")
+                extracted_json = extract_json_from_text(output)
+                potential_result = json.loads(extracted_json)
+                if all(key in potential_result for key in ['is_computational_science', 'has_development_info', 'paper_type']):
+                    validation_result = potential_result
+                    logger.info("Successfully parsed JSON using extraction method")
             except Exception as e:
-                logger.warning(f"JSON extraction failed: {str(e)}")
+                logger.warning(f"JSON extraction method failed: {str(e)}")
         
         if not validation_result:
             logger.error("Failed to parse JSON: No valid JSON object found")

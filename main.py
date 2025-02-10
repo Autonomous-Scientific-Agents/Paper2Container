@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import argparse
 import json
@@ -7,6 +8,7 @@ import random
 import yaml
 import subprocess
 import shutil
+import select
 from pathlib import Path
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
@@ -120,8 +122,17 @@ class WorkspaceDebugger(BaseTool):
                 "status": debug_session["status"],
                 "attempts": debug_session["attempts"],
                 "fixed_issues": debug_session["fixed_issues"],
-                "remaining_errors": debug_session["current_errors"] if debug_session["status"] == "failed" else []
+                "remaining_errors": debug_session["current_errors"] if debug_session["status"] in ["failed", "max_retries_reached"] else []
             }
+            
+            # Continue debugging if build failed and interactive mode is enabled
+            if debug_session["status"] == "failed" and self.interactive:
+                user_input = input("\nBuild failed. Would you like to continue debugging? (y/n): ")
+                if user_input.lower() == 'y':
+                    debug_session["attempts"] = 0
+                    debug_session["status"] = "in_progress"
+                    logger.info("Resetting debug attempts counter and continuing debugging...")
+                    return self._run(workspace_path)
             
             return json.dumps(report, indent=2)
             
@@ -139,41 +150,80 @@ class WorkspaceDebugger(BaseTool):
             logger.info("Starting docker-compose build...")
             logger.info(f"Running command: docker-compose build --no-cache in {workspace_path}")
             
-            # First, try docker-compose build with detailed output
-            compose_result = subprocess.run(
-                ['docker-compose', 'build', '--no-cache', '--progress=plain'],
+            # Use Popen for real-time output streaming with line buffering
+            process = subprocess.Popen(
+                ['docker', 'compose', 'build', '--no-cache'],
                 cwd=workspace_path,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
+                universal_newlines=True,
                 env={**os.environ, 'DOCKER_BUILDKIT': '1', 'COMPOSE_DOCKER_CLI_BUILD': '1'}
             )
             
-            # Combine stdout and stderr for comprehensive error analysis
-            full_output = compose_result.stdout + "\n" + compose_result.stderr
+            # Initialize variables for output collection
+            full_output = []
+            last_output_time = time.time()
+            spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            spinner_idx = 0
             
-            # Log the command output
-            logger.info("Build command output:")
-            logger.info(full_output)
+            # Process output in real-time
+            while True:
+                # Read output line by line with non-blocking
+                stdout_ready = select.select([process.stdout], [], [], 0.1)[0] != []
+                stderr_ready = select.select([process.stderr], [], [], 0.1)[0] != []
+                
+                current_time = time.time()
+                if stdout_ready:
+                    stdout_line = process.stdout.readline()
+                    if stdout_line:
+                        line = stdout_line.strip()
+                        print(line)
+                        full_output.append(line)
+                        last_output_time = current_time
+                
+                if stderr_ready:
+                    stderr_line = process.stderr.readline()
+                    if stderr_line:
+                        line = stderr_line.strip()
+                        print(line, file=sys.stderr)
+                        full_output.append(line)
+                        last_output_time = current_time
+                
+                # Show spinner if no output for more than 1 second
+                if current_time - last_output_time > 1:
+                    print(f'\rBuilding {spinner_chars[spinner_idx]} ', end='')
+                    spinner_idx = (spinner_idx + 1) % len(spinner_chars)
+                    sys.stdout.flush()
+                
+                # Check if process has completed
+                if process.poll() is not None:
+                    print('\r', end='')  # Clear spinner line
+                    sys.stdout.flush()
+                    # Get any remaining output
+                    remaining_stdout, remaining_stderr = process.communicate()
+                    if remaining_stdout:
+                        for line in remaining_stdout.splitlines():
+                            print(line.strip())
+                            full_output.append(line.strip())
+                    if remaining_stderr:
+                        for line in remaining_stderr.splitlines():
+                            print(line.strip(), file=sys.stderr)
+                            full_output.append(line.strip())
+                    break
+                
+            # Combine all output for analysis
+            full_output_str = '\n'.join(full_output)
             
-            if compose_result.returncode == 0:
-                # Even with success return code, check for warning patterns
-                if any(pattern in full_output.lower() for pattern in ['warning:', 'error:', 'failed']):
-                    return {
-                        "success": False,
-                        "errors": [{
-                            "type": "docker_compose_build_warning",
-                            "message": full_output,
-                            "exit_code": compose_result.returncode
-                        }]
-                    }
+            if process.returncode == 0:
                 return {"success": True, "errors": []}
             
-            # Parse the error output to identify specific issues
-            error_lines = full_output.split('\n')
+            # Parse error output for specific issues
             parsed_errors = []
             current_error = ""
             
-            for line in error_lines:
+            for line in full_output:
                 if any(pattern in line.lower() for pattern in ['error:', 'failed:', 'fatal:', 'exception']):
                     if current_error:
                         parsed_errors.append(current_error)
@@ -188,11 +238,12 @@ class WorkspaceDebugger(BaseTool):
                 "success": False,
                 "errors": [{
                     "type": "docker_compose_build_error",
-                    "message": error if error else full_output,
-                    "exit_code": compose_result.returncode,
-                    "full_output": full_output
-                } for error in (parsed_errors if parsed_errors else [full_output])]
+                    "message": error if error else full_output_str,
+                    "exit_code": process.returncode,
+                    "full_output": full_output_str
+                } for error in (parsed_errors if parsed_errors else [full_output_str])]
             }
+                
         except Exception as e:
             return {
                 "success": False,
@@ -203,7 +254,7 @@ class WorkspaceDebugger(BaseTool):
             }
     
     def _fix_configuration(self, workspace_path: str, errors: List[Dict]) -> Dict:
-        """Analyzes errors and attempts to fix Docker configuration files."""
+        """Analyzes errors and attempts to fix Docker configuration files using LLM."""
         try:
             # Read current configuration files
             dockerfile_path = os.path.join(workspace_path, 'Dockerfile')
@@ -233,6 +284,10 @@ Instructions:
 2. Determine which files need modifications
 3. Provide specific fixes while maintaining the original configuration structure
 4. Ensure all changes are compatible with Docker best practices
+5. If you see 'sys' module related errors, make sure to import it
+6. Check for any missing dependencies or imports
+7. Verify file paths and permissions
+8. Ensure proper error handling is in place
 
 IMPORTANT: You MUST respond with ONLY a valid JSON object in the following format:
 
@@ -260,14 +315,19 @@ IMPORTANT: You MUST respond with ONLY a valid JSON object in the following forma
 
 NO additional text, explanations, or markdown formatting should be included."""
             
-            # Get fix suggestions with retries
+            # Get fix suggestions with retries and improved error handling
             max_retries = 3
             retry_delay = 2
+            last_error = None
             
             for attempt in range(max_retries):
                 try:
                     response = self.llm.invoke(fix_prompt)
-                    if not response or not response.content:
+                    
+                    # Handle string responses from older LLM versions
+                    content = response.content if hasattr(response, 'content') else response
+                    
+                    if not content:
                         logger.warning(f"Empty response from LLM on attempt {attempt + 1}")
                         if attempt < max_retries - 1:
                             time.sleep(retry_delay * (attempt + 1))
@@ -275,7 +335,7 @@ NO additional text, explanations, or markdown formatting should be included."""
                         return {"fixed": False, "changes": "Empty response from LLM after retries"}
                     
                     # Clean and parse response
-                    cleaned_response = response.content.strip()
+                    cleaned_response = content.strip()
                     cleaned_response = re.sub(r'```(?:json)?\s*', '', cleaned_response)
                     cleaned_response = cleaned_response.replace('```', '').strip()
                     
@@ -284,39 +344,47 @@ NO additional text, explanations, or markdown formatting should be included."""
                     
                     # Apply fixes based on the structured response
                     if fixes["fixes"]["dockerfile"]["needs_update"] and fixes["fixes"]["dockerfile"]["content"]:
+                        # Backup original file
+                        if os.path.exists(dockerfile_path):
+                            shutil.copy2(dockerfile_path, f"{dockerfile_path}.bak")
+                        
                         with open(dockerfile_path, 'w') as f:
                             f.write(fixes["fixes"]["dockerfile"]["content"])
                         changes_made = True
+                        logger.info(f"Updated Dockerfile with fixes")
                     
                     if fixes["fixes"]["docker_compose"]["needs_update"] and fixes["fixes"]["docker_compose"]["content"]:
+                        # Backup original file
+                        if os.path.exists(compose_path):
+                            shutil.copy2(compose_path, f"{compose_path}.bak")
+                        
                         with open(compose_path, 'w') as f:
                             f.write(fixes["fixes"]["docker_compose"]["content"])
                         changes_made = True
+                        logger.info(f"Updated docker-compose.yml with fixes")
                     
                     return {
                         "fixed": changes_made,
                         "changes": {
                             "analysis": fixes["analysis"],
                             "explanation": fixes["explanation"],
-                            "recommendations": fixes["recommendations"]
+                            "recommendations": fixes["recommendations"],
+                            "backups_created": changes_made
                         }
                     }
                     
                 except json.JSONDecodeError as je:
-                    logger.error(f"Failed to parse JSON on attempt {attempt + 1}: {str(je)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay * (attempt + 1))
-                        continue
-                    return {"fixed": False, "changes": f"Invalid JSON response: {str(je)}"}
-                
+                    last_error = f"Failed to parse JSON on attempt {attempt + 1}: {str(je)}"
+                    logger.error(last_error)
                 except Exception as e:
-                    logger.error(f"Error in LLM processing on attempt {attempt + 1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay * (attempt + 1))
-                        continue
-                    return {"fixed": False, "changes": f"LLM processing error: {str(e)}"}
+                    last_error = f"Error in LLM processing on attempt {attempt + 1}: {str(e)}"
+                    logger.error(last_error)
+                
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
             
-            return {"fixed": False, "changes": "Failed after all retries"}
+            return {"fixed": False, "changes": last_error or "Failed after all retries"}
                 
         except Exception as e:
             logger.error(f"Error fixing configuration: {str(e)}")
@@ -1074,21 +1142,47 @@ def main():
             # Invoke workspace creator with the clean JSON string
             workspace_response = workspace_creator.invoke({"input": dev_details_str})
             
-            # Process workspace response
+            # Process workspace response with enhanced JSON parsing
             if isinstance(workspace_response, dict) and 'output' in workspace_response:
                 output = workspace_response['output']
+                workspace_result = None
                 
-                # Try to find JSON in the output using the same pattern as before
+                # Try multiple parsing strategies
                 try:
-                    json_pattern = r'({[\s\S]*?})\s*(?:>|\n|$)'
-                    match = re.search(json_pattern, output)
-                    if match:
-                        workspace_result = json.loads(match.group(1))
-                        logger.info("Successfully parsed workspace creation result")
-                    else:
-                        workspace_result = {"status": "error", "message": "Could not extract JSON from response"}
+                    # Strategy 1: Direct JSON parsing
+                    try:
+                        workspace_result = json.loads(output)
+                    except json.JSONDecodeError:
+                        pass
+                    
+                    # Strategy 2: Extract JSON with regex pattern
+                    if not workspace_result:
+                        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+                        matches = list(re.finditer(json_pattern, output))
+                        if matches:
+                            for match in matches:
+                                try:
+                                    potential_result = json.loads(match.group(0))
+                                    if isinstance(potential_result, dict) and 'status' in potential_result:
+                                        workspace_result = potential_result
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                    
+                    # Strategy 3: Clean and parse
+                    if not workspace_result:
+                        cleaned_output = re.sub(r'```(?:json)?\s*', '', output)
+                        cleaned_output = re.sub(r'```\s*$', '', cleaned_output)
+                        try:
+                            workspace_result = json.loads(cleaned_output)
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    if not workspace_result:
+                        workspace_result = {"status": "error", "message": "Could not parse workspace response"}
+                        
                 except Exception as e:
-                    workspace_result = {"status": "error", "message": f"Error parsing workspace response: {str(e)}"}
+                    workspace_result = {"status": "error", "message": f"Error processing workspace response: {str(e)}"}
             else:
                 workspace_result = {"status": "error", "message": "Invalid workspace response format"}
             
